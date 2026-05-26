@@ -1,75 +1,78 @@
-import asyncio
-import logging
 import os
+import logging
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import Message
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
 from dotenv import load_dotenv
-from ollama import Client
+import aiohttp
 
-# --- Setup ---
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-AI_MODEL = os.getenv("AI_MODEL", "llama3.2:3b")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+AI_API_URL = os.getenv("AI_API_URL", "https://openrouter.ai/api/v1/chat/completions")
+AI_API_KEY = os.getenv("AI_API_KEY")
 
-# Init bot, dispatcher, and AI client
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-ollama_client = Client(host=OLLAMA_HOST)
-
-# Logging
 logging.basicConfig(level=logging.INFO)
 
-# --- Helper Functions ---
-async def paraphrase_text(text: str) -> str:
-    """Sends text to Ollama with a paraphrasing prompt."""
-    prompt = f"""You are a helpful assistant that rewrites content.
-    TASK: Rewrite the following text to express the same meaning but using different words and sentence structures. Output the rewritten text only, no explanations or extra text.
-    TEXT: {text}
-    REWRITTEN TEXT:"""
-    
-    try:
-        response = ollama_client.generate(model=AI_MODEL, prompt=prompt)
-        return response['response'].strip()
-    except Exception as e:
-        logging.error(f"Ollama error: {e}")
-        return "Sorry, I'm having trouble processing your request right now."
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 
-# --- Command Handlers ---
+async def paraphrase_via_api(text: str) -> str:
+    """Calls external AI API to rewrite the text."""
+    headers = {
+        "Authorization": f"Bearer {AI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "meta-llama/llama-3.2-3b-instruct:free",
+        "messages": [
+            {"role": "system", "content": "You are a paraphrasing assistant. Rewrite the user's text using different words while keeping the same meaning. Output only the rewritten text, no explanations."},
+            {"role": "user", "content": text}
+        ],
+        "temperature": 0.7
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(AI_API_URL, headers=headers, json=payload) as resp:
+            data = await resp.json()
+            return data["choices"][0]["message"]["content"].strip()
+
 @dp.message(Command("start"))
 async def start_command(message: Message):
-    await message.answer("👋 Hi! Send me any text and I'll rewrite it in a new way!")
+    await message.answer("👋 Send me any text and I'll rewrite it for you!")
 
 @dp.message(Command("help"))
 async def help_command(message: Message):
-    help_text = "📝 **How to use me:**\n\n"
-    help_text += "Just send me any text message, and I'll send back a rewritten version.\n"
-    help_text += "Or use the `/rewrite` command followed by your text.\n"
-    help_text += "Example: `/rewrite The meeting is postponed until Friday.`"
-    await message.answer(help_text, parse_mode="Markdown")
-
-@dp.message(Command("rewrite"))
-async def rewrite_command(message: Message):
-    text_to_rewrite = message.text.replace("/rewrite", "", 1).strip()
-    if not text_to_rewrite:
-        await message.answer("Please provide text to rewrite. Example: `/rewrite Hello world!`")
-        return
-    
-    await message.answer("🔄 Rewriting your text, please wait...")
-    result = await paraphrase_text(text_to_rewrite)
-    await message.answer(result)
+    await message.answer("Just send any text — I'll send back a paraphrased version.")
 
 @dp.message()
-async def rewrite_text(message: Message):
-    """Handles any other text message as a request for paraphrasing."""
-    await message.answer("🔄 Let me rewrite that for you...")
-    result = await paraphrase_text(message.text)
+async def handle_text(message: Message):
+    await message.answer("🔄 Rewriting your text...")
+    result = await paraphrase_via_api(message.text)
     await message.answer(result)
 
-# --- Main Execution ---
-async def main():
-    await dp.start_polling(bot)
+async def on_startup():
+    """Sets up webhook when the bot starts."""
+    await bot.set_webhook(WEBHOOK_URL)
+    logging.info(f"Webhook set to {WEBHOOK_URL}")
+
+async def on_shutdown():
+    """Cleans up webhook and closes bot session."""
+    await bot.delete_webhook()
+    await bot.session.close()
+
+def main():
+    """Runs the bot with webhook."""
+    app = web.Application()
+    webhook_requests_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
+    webhook_requests_handler.register(app, path="/webhook")
+    setup_application(app, dp, bot=bot)
+    
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+    
+    web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
